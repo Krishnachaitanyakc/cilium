@@ -26,6 +26,9 @@
 #define SRC_NODE_V6			(const union v6addr *)v6_node_one
 #define DST_NODE_V6			(const union v6addr *)v6_node_two
 
+#define VXLAN_PORT			bpf_htons(8472)
+#define GENERAL_PORT			bpf_htons(12134)
+
 #define DST_NODE_ID			123
 #define ENCRYPT_KEY			0xFF
 
@@ -113,8 +116,17 @@ int v4_build_packet(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
 	struct iphdr *l3;
+	struct vxlanhdr *vxlan __maybe_unused;
 
 	pktgen__init(&builder, ctx);
+
+#ifdef TUNNEL_MODE
+	vxlan = pktgen__push_ipv4_vxlan_packet(&builder, (__u8 *)mac_one, (__u8 *)mac_two,
+					       SRC_NODE_V4, DST_NODE_V4,
+					       GENERAL_PORT, VXLAN_PORT);
+	if (!vxlan)
+		return TEST_ERROR;
+#endif
 
 	l3 = pktgen__push_ipv4_packet(&builder, (__u8 *)mac_one, (__u8 *)mac_two,
 				      SRC_POD_V4, DST_POD_V4);
@@ -128,6 +140,8 @@ int v4_build_packet(struct __ctx_buff *ctx)
 /* Validate that if the destination endpoint is being torn down (and
  * its ipcache entry is missing), then the corresponding PodCIDR entry
  * is still sufficient to apply encryption for a pod-to-pod packet.
+ * For Overlay, as long as the packet mark carries the identity we
+ * always encrypt the packet.
  */
 PKTGEN("tc", "encrypt_v4_1_missing_dst")
 int encrypt_v4_1_missing_dst_pktgen(struct __ctx_buff *ctx)
@@ -138,16 +152,22 @@ int encrypt_v4_1_missing_dst_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "encrypt_v4_1_missing_dst")
 int encrypt_v4_1_missing_dst_setup(struct __ctx_buff *ctx)
 {
+#ifndef TUNNEL_MODE
 	ipcache_v4_add_entry_with_mask_size(DST_POD_CIDR_V4, 0, WORLD_ID,
 					    DST_NODE_V4, ENCRYPT_KEY,
 					    v4_pod_cidr_size);
+#endif
 
 #ifdef ENABLE_IPSEC
 	ipsec_set_encrypt_state(ENCRYPT_KEY);
 	node_v4_add_entry(DST_NODE_V4, DST_NODE_ID, ENCRYPT_KEY);
 #endif
 
+#ifdef TUNNEL_MODE
+	set_identity_mark(ctx, SRC_POD_SEC_IDENTITY, MARK_MAGIC_OVERLAY);
+#else
 	set_identity_mark(ctx, SRC_POD_SEC_IDENTITY, MARK_MAGIC_IDENTITY);
+#endif
 
 	return netdev_send_packet(ctx);
 }
@@ -163,6 +183,9 @@ int encrypt_v4_1_missing_dst_check(const struct __ctx_buff *ctx)
  * First we test *with* the sec identity in the mark. This should be
  * sufficient to trigger encryption, even if the endpoint's ipcache entry
  * is not available.
+ *
+ * For Overlay, as long as the packet mark carries the identity we
+ * always encrypt the packet.
  */
 PKTGEN("tc", "encrypt_v4_2_src_mark")
 int encrypt_v4_2_src_mark_pktgen(struct __ctx_buff *ctx)
@@ -173,10 +196,14 @@ int encrypt_v4_2_src_mark_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "encrypt_v4_2_src_mark")
 int encrypt_v4_2_src_mark_setup(struct __ctx_buff *ctx)
 {
+#ifdef TUNNEL_MODE
+	set_identity_mark(ctx, SRC_POD_SEC_IDENTITY, MARK_MAGIC_OVERLAY);
+#else
 	ipcache_v4_add_entry(DST_POD_V4, 0, DST_POD_SEC_IDENTITY,
 			     DST_NODE_V4, ENCRYPT_KEY);
 
 	set_identity_mark(ctx, SRC_POD_SEC_IDENTITY, MARK_MAGIC_IDENTITY);
+#endif
 
 	return netdev_send_packet(ctx);
 }
@@ -189,6 +216,8 @@ int encrypt_v4_2_src_mark_check(const struct __ctx_buff *ctx)
 
 /* Now test *without* the identity in the mark. This should *not* trigger
  * encryption. Strict-Mode should capture the packet.
+ * For Overlay, if the packet *does not* carry the identity mark we
+ * never encrypt the packet.
  */
 PKTGEN("tc", "encrypt_v4_3_no_src_mark")
 int encrypt_v4_3_no_src_mark_pktgen(struct __ctx_buff *ctx)
@@ -205,14 +234,17 @@ int encrypt_v4_3_no_src_mark_setup(struct __ctx_buff *ctx)
 CHECK("tc", "encrypt_v4_3_no_src_mark")
 int encrypt_v4_3_no_src_mark_check(const struct __ctx_buff *ctx)
 {
-#ifdef ENCRYPTION_STRICT_MODE_EGRESS
+#if !defined(TUNNEL_MODE) && defined(ENCRYPTION_STRICT_MODE_EGRESS)
 	return check(ctx, CTX_ACT_DROP);
 #else
 	return check(ctx, CTX_ACT_OK);
 #endif
 }
 
-/* Finally test without the mark, but with the endpoint's ipcache entry: */
+/* Finally test without the mark, but with the endpoint's ipcache entry.
+ * For Overlay, if the packet *does not* carry the identity mark we
+ * never encrypt the packet.
+ */
 PKTGEN("tc", "encrypt_v4_4_no_src_mark_with_src_entry")
 int encrypt_v4_4_no_src_mark_with_src_entry_pktgen(struct __ctx_buff *ctx)
 {
@@ -222,8 +254,10 @@ int encrypt_v4_4_no_src_mark_with_src_entry_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "encrypt_v4_4_no_src_mark_with_src_entry")
 int encrypt_v4_4_no_src_mark_with_src_entry_setup(struct __ctx_buff *ctx)
 {
+#ifndef TUNNEL_MODE
 	ipcache_v4_add_entry(SRC_POD_V4, 0, SRC_POD_SEC_IDENTITY,
 			     0, ENCRYPT_KEY);
+#endif
 
 	return netdev_send_packet(ctx);
 }
@@ -231,7 +265,11 @@ int encrypt_v4_4_no_src_mark_with_src_entry_setup(struct __ctx_buff *ctx)
 CHECK("tc", "encrypt_v4_4_no_src_mark_with_src_entry")
 int encrypt_v4_4_no_src_mark_with_src_entry_check(const struct __ctx_buff *ctx)
 {
+#ifdef TUNNEL_MODE
+	return check(ctx, CTX_ACT_OK);
+#else
 	return check(ctx, CTX_ACT_REDIRECT);
+#endif
 }
 
 /* IPv6 variants of the tests.*/
@@ -240,9 +278,18 @@ static __always_inline
 int v6_build_packet(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
+	struct vxlanhdr *vxlan __maybe_unused;
 	struct ipv6hdr *l3;
 
 	pktgen__init(&builder, ctx);
+
+#ifdef TUNNEL_MODE
+	vxlan = pktgen__push_ipv6_vxlan_packet(&builder, (__u8 *)mac_one, (__u8 *)mac_two,
+					       (__u8 *)SRC_NODE_V6, (__u8 *)DST_NODE_V6,
+					       GENERAL_PORT, VXLAN_PORT);
+	if (!vxlan)
+		return TEST_ERROR;
+#endif
 
 	l3 = pktgen__push_ipv6_packet(&builder, (__u8 *)mac_one, (__u8 *)mac_two,
 				      (__u8 *)SRC_POD_V6, (__u8 *)DST_POD_V6);
@@ -262,16 +309,22 @@ int encrypt_v6_1_missing_dst_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "encrypt_v6_1_missing_dst")
 int encrypt_v6_1_missing_dst_setup(struct __ctx_buff *ctx)
 {
+#ifndef TUNNEL_MODE
 	ipcache_v6_add_entry_with_mask_size_ipv6_underlay(DST_POD_CIDR_V6, 0, WORLD_ID,
 							  DST_NODE_V6, ENCRYPT_KEY,
 							  v6_pod_cidr_size);
+#endif
 
 #ifdef ENABLE_IPSEC
 	ipsec_set_encrypt_state(ENCRYPT_KEY);
 	node_v6_add_entry(DST_NODE_V6, DST_NODE_ID, ENCRYPT_KEY);
 #endif
 
+#ifdef TUNNEL_MODE
+	set_identity_mark(ctx, SRC_POD_SEC_IDENTITY, MARK_MAGIC_OVERLAY);
+#else
 	set_identity_mark(ctx, SRC_POD_SEC_IDENTITY, MARK_MAGIC_IDENTITY);
+#endif
 
 	return netdev_send_packet(ctx);
 }
@@ -291,10 +344,14 @@ int encrypt_v6_2_src_mark_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "encrypt_v6_2_src_mark")
 int encrypt_v6_2_src_mark_setup(struct __ctx_buff *ctx)
 {
+#ifdef TUNNEL_MODE
+	set_identity_mark(ctx, SRC_POD_SEC_IDENTITY, MARK_MAGIC_OVERLAY);
+#else
 	ipcache_v6_add_entry_ipv6_underlay(DST_POD_V6, 0, DST_POD_SEC_IDENTITY,
 					   DST_NODE_V6, ENCRYPT_KEY);
 
 	set_identity_mark(ctx, SRC_POD_SEC_IDENTITY, MARK_MAGIC_IDENTITY);
+#endif
 
 	return netdev_send_packet(ctx);
 }
@@ -332,8 +389,10 @@ int encrypt_v6_4_no_src_mark_with_src_entry_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "encrypt_v6_4_no_src_mark_with_src_entry")
 int encrypt_v6_4_no_src_mark_with_src_entry_setup(struct __ctx_buff *ctx)
 {
+#ifndef TUNNEL_MODE
 	ipcache_v6_add_entry(SRC_POD_V6, 0, SRC_POD_SEC_IDENTITY,
 			     0, ENCRYPT_KEY);
+#endif
 
 	return netdev_send_packet(ctx);
 }
@@ -341,5 +400,9 @@ int encrypt_v6_4_no_src_mark_with_src_entry_setup(struct __ctx_buff *ctx)
 CHECK("tc", "encrypt_v6_4_no_src_mark_with_src_entry")
 int encrypt_v6_4_no_src_mark_with_src_entry_check(const struct __ctx_buff *ctx)
 {
+#ifdef TUNNEL_MODE
+	return check(ctx, CTX_ACT_OK);
+#else
 	return check(ctx, CTX_ACT_REDIRECT);
+#endif
 }
